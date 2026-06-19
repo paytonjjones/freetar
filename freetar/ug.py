@@ -2,10 +2,183 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote, urlparse
 import json
+import logging
 import re
+import os
+import hashlib
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
 from dataclasses import dataclass, field
 from .utils import FreetarError
+
+LOGGER = logging.getLogger(__name__)
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+LOCAL_MODE = os.environ.get("FREETAR_LOCAL", "").lower() in ("1", "true", "yes", "on")
+DISK_CACHE = os.environ.get("FREETAR_DISK_CACHE", "").lower() in ("1", "true", "yes", "on")
+DISK_CACHE_DIR = Path(os.environ.get("FREETAR_DISK_CACHE_DIR", "~/.cache/freetar")).expanduser()
+
+
+def configure_ug(local: bool = None, disk_cache: bool = None, disk_cache_dir: str = None):
+    global LOCAL_MODE, DISK_CACHE, DISK_CACHE_DIR
+    if local is not None:
+        LOCAL_MODE = local
+    if disk_cache is not None:
+        DISK_CACHE = disk_cache
+    if disk_cache_dir:
+        DISK_CACHE_DIR = Path(disk_cache_dir).expanduser()
+
+
+def _cache_key(mode: str, kind: str, url: str, params: dict = None) -> str:
+    payload = json.dumps({
+        "mode": mode,
+        "kind": kind,
+        "url": url,
+        "params": params or {},
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _cache_paths(cache_key: str) -> tuple[Path, Path]:
+    return DISK_CACHE_DIR / f"{cache_key}.txt", DISK_CACHE_DIR / f"{cache_key}.json"
+
+
+def _read_disk_cache(cache_key: str) -> Optional[str]:
+    raw_path, meta_path = _cache_paths(cache_key)
+    if not raw_path.exists() or not meta_path.exists():
+        return None
+    return raw_path.read_text()
+
+
+def _write_disk_cache(cache_key: str, text: str, metadata: dict):
+    DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path, meta_path = _cache_paths(cache_key)
+    raw_path.write_text(text)
+    meta_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+
+
+def _normalise_tab_path(tab_path: str) -> str:
+    path = urlparse(str(tab_path)).path
+    if path.startswith("/tab/"):
+        path = path[len("/tab/"):]
+    return path.strip("/")
+
+
+def clear_disk_cache(keep_tab_paths: list[str] = None) -> dict:
+    if not DISK_CACHE_DIR.exists():
+        return {"deleted": 0, "kept": 0}
+
+    keep = {_normalise_tab_path(path) for path in (keep_tab_paths or [])}
+    deleted = 0
+    kept = 0
+    for meta_path in DISK_CACHE_DIR.glob("*.json"):
+        raw_path = meta_path.with_suffix(".txt")
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except (OSError, ValueError):
+            metadata = {}
+
+        should_keep = (
+            metadata.get("kind") == "tab"
+            and _normalise_tab_path(metadata.get("tab_path", "")) in keep
+        )
+        if should_keep:
+            kept += 1
+            continue
+
+        for path in (meta_path, raw_path):
+            try:
+                path.unlink()
+                deleted += 1
+            except FileNotFoundError:
+                pass
+
+    return {"deleted": deleted, "kept": kept}
+
+
+def _log_fetch_failure(kind: str, url: str, response: requests.Response = None):
+    mode = "local" if LOCAL_MODE else "proxy"
+    status_code = response.status_code if response is not None else None
+    final_url = response.url if response is not None else url
+    redirect_target = None
+    if response is not None:
+        redirect_target = response.headers.get("Location")
+        if not redirect_target and response.url != url:
+            redirect_target = response.url
+    snippet = ""
+    if response is not None and response.text:
+        snippet = response.text[:300].replace("\n", " ")
+
+    LOGGER.warning(
+        "Ultimate Guitar fetch failed mode=%s kind=%s url=%s status=%s redirect=%s snippet=%r",
+        mode,
+        kind,
+        final_url,
+        status_code,
+        redirect_target,
+        snippet,
+    )
+
+
+def _fetch_upstream(kind: str, url: str, params: dict = None, metadata: dict = None) -> str:
+    mode = "local" if LOCAL_MODE else "proxy"
+    cache_key = _cache_key(mode, kind, url, params)
+    if DISK_CACHE:
+        cached = _read_disk_cache(cache_key)
+        if cached is not None:
+            LOGGER.info("Using disk cache for %s %s", kind, url)
+            return cached
+
+    response = None
+    try:
+        response = SESSION.get(url, params=params, timeout=20)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        _log_fetch_failure(kind, url, response)
+        raise e
+
+    if DISK_CACHE:
+        request_metadata = {
+            "created": datetime.now(timezone.utc).isoformat(),
+            "kind": kind,
+            "mode": mode,
+            "original_url": response.url,
+        }
+        request_metadata.update(metadata or {})
+        _write_disk_cache(cache_key, response.text, request_metadata)
+
+    return response.text
+
+
+def _parse_store_data(html: str) -> dict:
+    bs = BeautifulSoup(html, 'html.parser')
+    data = bs.find("div", {"class": "js-store"})
+    return json.loads(data.attrs['data-content'])
+
+
+def _search_url(value: str, page: int) -> tuple[str, Optional[dict]]:
+    if LOCAL_MODE:
+        return "https://www.ultimate-guitar.com/search.php", {
+            "page": page,
+            "search_type": "title",
+            "value": value,
+        }
+    return f"https://proxy.freetar.de/search.php?page={page}&search_type=title&value={quote(value)}", None
+
+
+def _tab_url(url_path: str) -> str:
+    base_url = "https://tabs.ultimate-guitar.com/tab/" if LOCAL_MODE else "https://tabs.proxy.freetar.de/tab/"
+    return base_url + str(url_path)
 
 
 @dataclass
@@ -104,11 +277,12 @@ class Search:
 
     def __init__(self, value: str, page: int):
         try:
-            resp = requests.get(f"https://proxy.freetar.de/search.php?page={page}&search_type=title&value={quote(value)}")
-            resp.raise_for_status()
-            bs = BeautifulSoup(resp.text, 'html.parser') # data can be None
-            data = bs.find("div", {"class": "js-store"}) # KeyError
-            data = json.loads(data.attrs['data-content'])
+            url, params = _search_url(value, page)
+            html = _fetch_upstream("search", url, params=params, metadata={
+                "search_term": value,
+                "page": page,
+            })
+            data = _parse_store_data(html)
             self.results = self.get_results(data)
             self.total_pages = data['store']['page']['data']['pagination']['total']
             self.current_page = data['store']['page']['data']['pagination']['current']
@@ -187,12 +361,10 @@ def get_chords(s: SongDetail) -> SongDetail:
 
 def ug_tab(url_path: str):
     try:
-        resp = requests.get("https://tabs.proxy.freetar.de/tab/" + url_path)
-        resp.raise_for_status()
-        bs = BeautifulSoup(resp.text, 'html.parser')
-        data = bs.find("div", {"class": "js-store"})
-        data = data.attrs['data-content']
-        data = json.loads(data)
+        html = _fetch_upstream("tab", _tab_url(url_path), metadata={
+            "tab_path": _normalise_tab_path(url_path),
+        })
+        data = _parse_store_data(html)
         s = SongDetail(data)
         s.chords, s.fingers_for_strings = get_chords(s)
         return s

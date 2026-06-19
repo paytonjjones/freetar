@@ -1,10 +1,12 @@
 import waitress
 import os
-from flask import Flask, render_template, request
+import argparse
+import sys
+from flask import Flask, render_template, request, jsonify
 from flask_caching import Cache
 from flask_minify import Minify
 
-from freetar.ug import Search, ug_tab
+from freetar.ug import Search, ug_tab, configure_ug, clear_disk_cache
 from freetar.utils import get_version, FreetarError
 
 CACHE_TIMEOUT = int(os.environ.get("FREETAR_CACHE_TIMEOUT", 0))
@@ -70,6 +72,19 @@ def show_about():
     return render_template('about.html')
 
 
+@app.route("/cache/clear", methods=["POST"])
+def clear_cache_all():
+    result = clear_disk_cache()
+    return jsonify(result)
+
+
+@app.route("/cache/clear_keep_favorites", methods=["POST"])
+def clear_cache_keep_favorites():
+    payload = request.get_json(silent=True) or {}
+    result = clear_disk_cache(payload.get("favorites", []))
+    return jsonify(result)
+
+
 @app.errorhandler(403)
 @app.errorhandler(500)
 @app.errorhandler(FreetarError)
@@ -80,9 +95,27 @@ def internal_error(error):
                            error=error)
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local", action="store_true",
+                        help="Fetch Ultimate Guitar pages directly instead of through the public Freetar proxies.")
+    parser.add_argument("--cache", action="store_true",
+                        help="Persist raw upstream tab/search responses on disk.")
+    args = sys.argv[1:]
+    if args and args[0] == "--":
+        args = args[1:]
+    return parser.parse_args(args)
+
+
 def main():
+    args = _parse_args()
     host = os.getenv('FREETAR_HOST', '0.0.0.0')
     port = os.getenv('FREETAR_PORT', 22000)
+    configure_ug(
+        local=args.local or os.environ.get("FREETAR_LOCAL", "").lower() in ("1", "true", "yes", "on"),
+        disk_cache=args.cache or os.environ.get("FREETAR_DISK_CACHE", "").lower() in ("1", "true", "yes", "on"),
+        disk_cache_dir=os.environ.get("FREETAR_DISK_CACHE_DIR"),
+    )
     if __name__ == '__main__':
         app.run(debug=True,
                 host=host,

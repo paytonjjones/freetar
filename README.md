@@ -10,7 +10,7 @@ This is like [Invidious](https://invidious.io/) but only for [Ultimate Guitar](h
 ## Features
 - no ads, popups, AI, blockchain. Just a simple design
 - search for tabs and view them
-- save your favorite chords as favs (everything is stored in session storage (not send to the server), no account needed)
+- save your favorite chords as favs (everything is stored in local storage (not send to the server), no account needed)
 - dark mode
 - auto scroll
 - useful for printing chords
@@ -26,6 +26,9 @@ After successful installation, there is an executable called `freetar` in the PA
 * `FREETAR_HOST`
 * `FREETAR_PORT`
 * `FREETAR_CACHE_TIMEOUT` (how log should tabs be cached in memory, reduces the requests to Ultimate Guitar, defaults to 0 (inifnity))
+* `FREETAR_LOCAL` (`1` fetches directly from Ultimate Guitar instead of the public Freetar proxies)
+* `FREETAR_DISK_CACHE` (`1` stores raw upstream tab/search responses on disk)
+* `FREETAR_DISK_CACHE_DIR` (defaults to `~/.cache/freetar`)
 
 **PyPi**  
 Package: https://pypi.org/project/freetar/
@@ -70,6 +73,17 @@ Visit localhost:22000 in browser
 # html templates: freetar/templates/*
 FREETAR_CACHE_TIMEOUT=1 uv run freetar
 ```
+
+For local personal use against Ultimate Guitar directly:
+
+```shell
+uv run freetar -- --local --cache
+```
+
+`--local` is equivalent to `FREETAR_LOCAL=1`; `--cache` is equivalent to
+`FREETAR_DISK_CACHE=1`. Disk caching is separate from `FREETAR_CACHE_TIMEOUT`:
+it stores raw upstream tab/search responses in `~/.cache/freetar` by default.
+Ultimate Guitar may still block direct local requests. 
 
 ## Future work
 

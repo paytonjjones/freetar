@@ -71,7 +71,11 @@
   <strong class="d-block">Export favorites</strong>
   <button type="button" class="btn btn-secondary" onclick="exportFavorites()">Export</button><br/>
   <strong class="mt-3 d-block">Import favorites</strong>
-<input type="file" class="form-control" onchange="importFavorites(this)" />
+  <input type="file" class="form-control" onchange="importFavorites(this)" />
+  <strong class="mt-3 d-block">Disk cache</strong>
+  <button type="button" class="btn btn-secondary" onclick="clearDiskCache(true)">Clear cache (keep favorites)</button>
+  <button type="button" class="btn btn-secondary" onclick="clearDiskCache(false)">Clear cache (all)</button>
+  <small id="cache-clear-status" class="d-block mt-1"></small>
 </details>
 
 <script>
@@ -117,6 +121,28 @@
       };
       reader.readAsText(file);
       location.reload();
+    }
+  }
+
+  async function clearDiskCache(keepFavorites) {
+    const status = document.getElementById("cache-clear-status");
+    const favorites = JSON.parse(localStorage.getItem("favorites")) || {};
+    const url = keepFavorites ? "/cache/clear_keep_favorites" : "/cache/clear";
+    const payload = keepFavorites ? { favorites: Object.keys(favorites) } : {};
+    status.textContent = "Clearing cache...";
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const result = await response.json();
+      status.textContent = `Deleted ${result.deleted} cache file(s), kept ${result.kept} favorite tab cache(s).`;
+    } catch (error) {
+      status.textContent = `Could not clear cache: ${error}`;
     }
   }
 </script>
